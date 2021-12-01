@@ -1,5 +1,4 @@
 -- query for free trials experiment analysis Oct 27 - nov 18 2021
-
 with enrollments as
          (
              select a.fullvisitorid,
@@ -30,21 +29,23 @@ with enrollments as
                and a.date between '2021-10-27' and '2021-11-18'
              group by 1, 2, 3, 4
          ),
-     payments as (select account_code,
-                         max(case
-                                 when transaction_type = 'verify' and transaction_status = 'success' then 1
-                                 else null end) as verified_cc,
-                         max(case
-                                 when transaction_type = 'purchase' and transaction_status = 'success' and
-                                      payment_method = 'credit_card' then 1
-                                 else null end) as paid_cc,
-                         max(case
-                                 when transaction_type = 'purchase' and transaction_status = 'success' and
-                                      payment_method = 'paypal' then 1
-                                 else null end) as paid_paypal
-                  from ds_elements_recurly_transactions
-                  where created_at::Date >= '2021-10-27'
-                  group by 1)
+     payments as
+         (select account_code,
+                 max(case
+                         when transaction_type = 'verify' and transaction_status = 'success' then 1
+                         else null end) as verified_cc,
+                 max(case
+                         when transaction_type = 'purchase' and transaction_status = 'success' and
+                              payment_method in ('wire_transfer', 'credit_card') then 1
+                         else null end) as paid_cc,
+                 max(case
+                         when transaction_type = 'purchase' and transaction_status = 'success' and
+                              payment_method = 'paypal' then 1
+                         else null end) as paid_paypal
+
+          from ds_elements_recurly_transactions
+          where created_at::Date >= '2021-09-27'
+          group by 1)
         ,
      clean_sso as (
          select user_uuid,
@@ -78,6 +79,7 @@ with enrollments as
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              termination_date isnull and
                              has_successful_payment = true
+                            and first_canceled_at isnull
                             then 1 end)                                          as total_subs_remaining,
                 max(case
                         when d.subscription_start_date :: date >= '2021-10-27' and
@@ -96,22 +98,35 @@ with enrollments as
                              rf.sso_user_id is not null then 1 end)              as refunds,
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
+                             first_canceled_at isnull and
+                             f.account_code is not null
+                            and paid_cc isnull
+                            and paid_paypal isnull then 1 end)                   as failed_payments,
+
+                max(case
+                        when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              verified_cc = 1 then 1 end)                         as verified_cc,
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
-                             verified_cc isnull then 1 end)                      as failed_verified_cc,
+                             first_canceled_at isnull and
+                             f.account_code is not null
+                            and verified_cc isnull then 1 end)                   as failed_verified_cc,
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              paid_cc = 1 then 1 end)                             as payments_cc,
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
-                             paid_cc isnull then 1 end)                          as failed_payments_cc,
+                             first_canceled_at isnull and
+                             f.account_code is not null
+                            and paid_cc isnull then 1 end)                   as failed_payments_cc,
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              paid_paypal = 1 then 1 end)                         as payments_paypal,
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
-                             paid_paypal isnull then 1 end)                      as failed_payments_paypal,
+                             first_canceled_at isnull and
+                             f.account_code is not null
+                            and paid_paypal isnull then 1 end)                   as failed_payments_paypal,
 
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
@@ -122,13 +137,13 @@ with enrollments as
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              first_canceled_at isnull
-                            and
-                             (paid_cc isnull and paid_paypal isnull) then 1 end) as minus_failed_payments,
+                            and has_successful_payment = true
+                            and nvl(paid_cc, paid_paypal) = 1 then 1 end)        as minus_failed_payments,
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              first_canceled_at isnull
-                            and
-                             f.account_code is not null
+                            and has_successful_payment = true
+                            and nvl(paid_cc, paid_paypal) = 1
                             and rf.sso_user_id isnull then 1 end)                as minus_refunds,
 
 
@@ -187,6 +202,7 @@ with enrollments as
                  null                                                             as total_new_subs_terminated,
                  null                                                             as overall_subs,
                  null                                                             as refunds,
+                 null                                                             as failed_payments,
                  null                                                             as verified_cc,
                  null                                                             as failed_verified_cc,
                  null                                                             as payments_cc,
@@ -233,6 +249,7 @@ select variant,
        count(returning_subs_retained)                                  as returning_subs_retained,
        count(overall_subs)                                             as overall_subscribers,
        count(refunds)                                                  as refunds,
+       count(failed_payments)                                          as failed_payments,
        count(verified_cc)                                              as verified_cc,
        count(failed_verified_cc)                                       as failed_verified_cc,
        count(payments_cc)                                              as payments_cc,
