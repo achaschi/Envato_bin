@@ -29,30 +29,35 @@ with enrollments as
                and a.date between '2021-10-27' and '2021-11-18'
              group by 1, 2, 3, 4
          ),
-     payments as
-         (select account_code,
-                 max(case
-                         when transaction_type = 'verify' and transaction_status = 'success' then 1
-                         else null end) as verified_cc,
-                 max(case
-                         when transaction_type = 'purchase' and transaction_status = 'success' and
-                              payment_method in ('wire_transfer', 'credit_card') then 1
-                         else null end) as paid_cc,
-                 max(case
-                         when transaction_type = 'purchase' and transaction_status = 'success' and
-                              payment_method = 'paypal' then 1
-                         else null end) as paid_paypal
-
-          from ds_elements_recurly_transactions
-          where created_at::Date >= '2021-09-27'
-          group by 1)
+     failed_payments as
+         (SELECT s.sso_user_id,
+                 t.payment_method
+          FROM elements.dim_elements_subscription s
+                   INNER JOIN elements.ds_elements_recurly_invoices i ON i.account_code = s.recurly_account_code
+                   INNER JOIN elements.ds_elements_recurly_line_items l
+                              ON l.invoice_number = i.invoice_number AND l.subscription_id = s.recurly_subscription_id
+-- get latest payment attempt for this invoice
+                   LEFT JOIN (SELECT invoice_number,
+                                     payment_method,
+                                     created_at,
+                                     ROW_NUMBER() OVER (PARTITION BY invoice_number ORDER BY created_at DESC) AS latest_transaction
+                              FROM elements.ds_elements_recurly_transactions
+                              WHERE transaction_type = 'purchase'
+                                AND transaction_status = 'declined') t
+                             ON t.invoice_number = i.invoice_number
+                                 AND t.latest_transaction = 1
+          WHERE s.termination_date IS NOT NULL                                -- terminated subscriptions
+            AND NVL(s.churned_date, s.termination_date) <> s.termination_date -- only include failed payments
+            AND s.plan_change IS FALSE                                        -- ignore plan changes
+            AND i.status = 'failed'                                           -- only included failed payments
+            AND subscription_start_date :: date between '2021-10-27' and '2021-11-18'
+          group by 1, 2)
         ,
      clean_sso as (
          select user_uuid,
                 max(country)                                                     as country,
                 variant,
                 split_part(min(sc.dss_update_time || '|' || sc.channel), '|', 2) as referer,
-                max(case when visitnumber = 1 then 1 end)                        as new_vis,
                 max(plan_type)                                                   as plan_type,
                 max(case
                         when d.trial_period_started_at_aet :: date between '2021-10-27' and '2021-11-18'
@@ -99,34 +104,16 @@ with enrollments as
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              first_canceled_at isnull and
-                             f.account_code is not null
-                            and paid_cc isnull
-                            and paid_paypal isnull then 1 end)                   as failed_payments,
+                             f.sso_user_id is not null then 1 end)               as failed_payments,
 
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
-                             verified_cc = 1 then 1 end)                         as verified_cc,
+                             first_canceled_at isnull and
+                             f.payment_method = 'credit_card' then 1 end)        as failed_payments_cc,
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              first_canceled_at isnull and
-                             f.account_code is not null
-                            and verified_cc isnull then 1 end)                   as failed_verified_cc,
-                max(case
-                        when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
-                             paid_cc = 1 then 1 end)                             as payments_cc,
-                max(case
-                        when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
-                             first_canceled_at isnull and
-                             f.account_code is not null
-                            and paid_cc isnull then 1 end)                   as failed_payments_cc,
-                max(case
-                        when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
-                             paid_paypal = 1 then 1 end)                         as payments_paypal,
-                max(case
-                        when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
-                             first_canceled_at isnull and
-                             f.account_code is not null
-                            and paid_paypal isnull then 1 end)                   as failed_payments_paypal,
+                             f.payment_method = 'paypal' then 1 end)             as failed_payments_paypal,
 
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
@@ -138,12 +125,12 @@ with enrollments as
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              first_canceled_at isnull
                             and has_successful_payment = true
-                            and nvl(paid_cc, paid_paypal) = 1 then 1 end)        as minus_failed_payments,
+                            and f.sso_user_id isnull then 1 end)                 as minus_failed_payments,
                 max(case
                         when d.subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                              first_canceled_at isnull
                             and has_successful_payment = true
-                            and nvl(paid_cc, paid_paypal) = 1
+                            and f.sso_user_id isnull
                             and rf.sso_user_id isnull then 1 end)                as minus_refunds,
 
 
@@ -162,6 +149,8 @@ with enrollments as
              and c.visitid = b.visitid
              and c.date between 20211027 and 20211118
 
+                join elements.ds_elements_sso_users sso on sso.id = c.user_uuid and split_part(email, '@', 2) != 'envato.com'
+
                   left join elements.dim_elements_subscription d on c.user_uuid = d.sso_user_id
 
                   left join (select sso_uuid, count(*) as dls
@@ -178,7 +167,7 @@ with enrollments as
 
                   left join elements.rpt_elements_session_channel sc on sc.sessionid = ss.sessionid
 
-                  left join payments f on d.recurly_account_code = f.account_code
+                  left join failed_payments f on d.sso_user_id = f.sso_user_id
          group by 1, 3),
 
      other_users as
@@ -186,7 +175,6 @@ with enrollments as
                  max(country)                                                     as country,
                  variant,
                  referer                                                          as referer,
-                 max(case when visitnumber = 1 then 1 end)                        as new_vis,
                  null                                                             as plan_type,
                  null                                                             as free_trial_status,
                  max(case when hits_page_pagepath like '%/subscribe%' then 1 end) as sub_page,
@@ -203,11 +191,7 @@ with enrollments as
                  null                                                             as overall_subs,
                  null                                                             as refunds,
                  null                                                             as failed_payments,
-                 null                                                             as verified_cc,
-                 null                                                             as failed_verified_cc,
-                 null                                                             as payments_cc,
                  null                                                             as failed_payments_cc,
-                 null                                                             as payments_paypal,
                  null                                                             as failed_payments_paypal,
                  null                                                             as cancelations,
                  null                                                             as minus_cancellation,
@@ -231,41 +215,36 @@ with enrollments as
 
 select variant,
        country,
-       case when new_vis = 1 then 'new_user' else 'returning_user' end as u_age,
        referer,
        plan_type,
-       count(free_trial_status)                                        as free_trials_started,
-       count(*)                                                        as users,
-       count(sub_page)                                                 as sub_page,
-       count(free_account_users)                                       as free_account_users,
-       count(pricing_page)                                             as pricing_page,
-       count(signups)                                                  as signups,
-       count(non_free_trial_signups)                                   as non_free_trial_signups,
-       count(total_new_signups)                                        as total_new_signups,
-       count(trial_sub_remaining)                                      as trial_sub_remaining,
-       count(total_subs_remaining)                                     as total_subs_remaining,
-       count(total_new_subs_terminated)                                as total_new_subs_terminated,
-       count(total_returning_subs_terminated)                          as total_returning_subs_terminated,
-       count(returning_subs_retained)                                  as returning_subs_retained,
-       count(overall_subs)                                             as overall_subscribers,
-       count(refunds)                                                  as refunds,
-       count(failed_payments)                                          as failed_payments,
-       count(verified_cc)                                              as verified_cc,
-       count(failed_verified_cc)                                       as failed_verified_cc,
-       count(payments_cc)                                              as payments_cc,
-       count(failed_payments_cc)                                       as failed_payments_cc,
-       count(payments_paypal)                                          as payments_paypal,
-       count(failed_payments_paypal)                                   as failed_payments_paypal,
-       count(cancellation)                                             as cancelations,
-       count(minus_cancellation)                                       as minus_cancellation,
-       count(minus_failed_payments)                                    as minus_failed_payments,
-       count(minus_refunds)                                            as minus_refunds,
-       count(downloads)                                                as downloaders,
-       sum(downloads)                                                  as downloads
+       count(free_trial_status)               as free_trials_started,
+       count(*)                               as users,
+       count(sub_page)                        as sub_page,
+       count(free_account_users)              as free_account_users,
+       count(pricing_page)                    as pricing_page,
+       count(signups)                         as signups,
+       count(non_free_trial_signups)          as non_free_trial_signups,
+       count(total_new_signups)               as total_new_signups,
+       count(trial_sub_remaining)             as trial_sub_remaining,
+       count(total_subs_remaining)            as total_subs_remaining,
+       count(total_new_subs_terminated)       as total_new_subs_terminated,
+       count(total_returning_subs_terminated) as total_returning_subs_terminated,
+       count(returning_subs_retained)         as returning_subs_retained,
+       count(overall_subs)                    as overall_subscribers,
+       count(refunds)                         as refunds,
+       count(failed_payments)                 as failed_payments,
+       count(failed_payments_cc)              as failed_payments_cc,
+       count(failed_payments_paypal)          as failed_payments_paypal,
+       count(cancellation)                    as cancelations,
+       count(minus_cancellation)              as minus_cancellation,
+       count(minus_failed_payments)           as minus_failed_payments,
+       count(minus_refunds)                   as minus_refunds,
+       count(downloads)                       as downloaders,
+       sum(downloads)                         as downloads
 from (select *
       from clean_sso
       union all
       select *
       from other_users) c
-group by 1, 2, 3, 4, 5
+group by 1, 2, 3, 4
 ;
