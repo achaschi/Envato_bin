@@ -1,45 +1,111 @@
-with enrollments as
-         (
-             select a.fullvisitorid,
-                    a.visitid,
-                    CASE
-                        WHEN se.geonetwork_country in ('United States', 'United Kingdom', 'Germany',
-                                                       'Canada', 'Australia', 'France', 'Italy', 'Spain',
-                                                       'Netherlands', 'Brazil',
-                                                       'India', 'South Korea', 'Turkey', 'Switzerland',
-                                                       'Japan', 'Spain')
-                            then se.geonetwork_country
-                        when geonetwork_country in ('Argentina', 'Bolivia', 'Chile',
-                                                    'Colombia', 'Costa Rica', 'Cuba', 'Ecuador', 'Mexico',
-                                                    'Paraguay', 'Uruguay',
-                                                    'Venezuela') then 'LATAM'
-                        when geonetwork_country in ('Belarus', 'Kazakhstan', 'Russia', 'Ukraine')
-                            then 'RU'
-                        else 'ROW' end                                            as country,
-                    variant,
-                    split_part(min(sc.dss_update_time || '|' || channel), '|', 2) as referer,
-                    min(se.visitnumber)                                           as visitnumber
-             from ds_bq_abtesting_enrolments_elements a
-                      join webanalytics.ds_bq_sessions_elements se
-                           on a.fullvisitorid = se.fullvisitorid::varchar and a.visitid = se.visitid and
-                              se.date between 20211027 and 20211118
-                      left join elements.rpt_elements_session_channel sc on se.sessionid = sc.sessionid
-             where experiment_id = 'geInrbFNTa2AZdiRswkP2A'
-               and a.date between '2021-10-27' and '2021-11-18'
-             group by 1, 2, 3, 4
-         ),
-     content_t as (select u.sso_uuid,
+-- big ft exp query
+drop table if exists enrollments;
+create temporary table enrollments as
+    (
+        select a.fullvisitorid,
+               a.visitid,
+               CASE
+                   WHEN se.geonetwork_country in ('United States', 'United Kingdom', 'Germany',
+                                                  'Canada', 'Australia', 'France', 'Italy', 'Spain',
+                                                  'Netherlands', 'Brazil',
+                                                  'India', 'South Korea', 'Turkey', 'Switzerland',
+                                                  'Japan', 'Spain')
+                       then se.geonetwork_country
+                   when geonetwork_country in ('Argentina', 'Bolivia', 'Chile',
+                                               'Colombia', 'Costa Rica', 'Cuba', 'Ecuador', 'Mexico',
+                                               'Paraguay', 'Uruguay',
+                                               'Venezuela') then 'LATAM'
+                   when geonetwork_country in ('Belarus', 'Kazakhstan', 'Russia', 'Ukraine')
+                       then 'RU'
+                   else 'ROW' end                                            as country,
+               variant,
+               split_part(min(sc.dss_update_time || '|' || channel), '|', 2) as referer,
+               min(se.visitnumber)                                           as visitnumber
+        from ds_bq_abtesting_enrolments_elements a
+                 join webanalytics.ds_bq_sessions_elements se
+                      on a.fullvisitorid = se.fullvisitorid::varchar and a.visitid = se.visitid and
+                         se.date between 20211027 and 20211118
+                 left join elements.rpt_elements_session_channel sc on se.sessionid = sc.sessionid
+        where experiment_id = 'geInrbFNTa2AZdiRswkP2A'
+          and a.date between '2021-10-27' and '2021-11-18'
+        group by 1, 2, 3, 4
+    );
+
+drop table if exists merge_t;
+create temporary table merge_t as
+    (with other_users as
+              (select b.fullvisitorid,
+
+                      max(country)                                                     as country,
+                      variant,
+                      max(case when hits_page_pagepath like '%/subscribe%' then 1 end) as sub_page,
+                      max(case when hits_page_pagepath like '%/pricing%' then 1 end)   as pricing_page
+
+               from enrollments b
+                        join (select fullvisitorid
+                              from ds_bq_abtesting_enrolments_elements
+                              where experiment_id = 'geInrbFNTa2AZdiRswkP2A'
+                                and date between '2021-10-27' and '2021-11-18'
+                              group by 1
+                              having min(variant) = max(variant)) using (fullvisitorid)
+                        join webanalytics.ds_bq_events_elements c on c.fullvisitorid::varchar = b.fullvisitorid
+                   and c.visitid = b.visitid
+                   and c.date between 20211027 and 20211118
+                   and c.user_uuid isnull
+               group by 1, 3
+              )
+
+     select variant,
+            country,
+            null                as plan_type,
+            null                as free_trials,
+            count(*)            as users,
+            count(sub_page)     as sub_page,
+            count(pricing_page) as pricing_page,
+            null                as non_free_trial_signups,
+            null                as total_new_signups,
+            null                as trial_sub_remaining,
+            null                as total_subs_remaining,
+            null                as total_new_subs_terminated,
+            null                as total_returning_subs_terminated,
+            null                as returning_subs_retained,
+--        count(refunds)                                                  as refunds,
+            null                as failed_payments,
+            null                as minus_cancellation,
+            null                as minus_failed_payments,
+--        count(minus_refunds)                                            as minus_refunds,
+            null                as downloads,
+            null                as revenue_usd,
+            null                as discounts,
+            null                as FT_dl,
+            null                as FT_licensed_dl,
+            null                as cancelled_trial,
+            null                as failpayment_trial
+     from other_users
+     group by 1, 2, 3
+    );
+
+drop table if exists content_t;
+create temporary table content_t
+    diststyle key
+    distkey(sso_uuid)
+    as (select u.sso_uuid,
 --                           i.content_type,
-                          case when user_project_id isnull then 'download' else 'project' end as license,
-                          count(i.item_id)                                                    as q
-                   from elements.ds_elements_item_downloads dl
-                            join elements.ds_elements_item_licenses l on dl.item_license_id = l.id
-                            join elements.dim_elements_items i on i.item_id = l.item_id
-                            join dim_users u on dl.user_id = u.elements_id
-                   where download_started_at :: date between '2021-10-27' and '2021-11-25'
-                   group by 1, 2),
-     failed_payments as
-         (SELECT s.sso_user_id || '|' || dim_subscription_key as sso_key
+                                            case when user_project_id isnull then 'download' else 'project' end as license,
+                                            count(i.item_id)                                                    as q
+                                     from elements.ds_elements_item_downloads dl
+                                              join elements.ds_elements_item_licenses l on dl.item_license_id = l.id
+                                              join elements.dim_elements_items i on i.item_id = l.item_id
+                                              join dim_users u on dl.user_id = u.elements_id
+                                     where download_started_at :: date between '2021-10-27' and '2021-11-25'
+                                     group by 1, 2);
+
+drop table if exists failed_payments;
+create temporary table failed_payments
+    diststyle key
+    distkey(sso_key)
+    as ( SELECT s.sso_user_id --|| '|' || dim_subscription_key
+                     as sso_key
 
 --                  t.payment_method
 
@@ -62,24 +128,43 @@ with enrollments as
             AND s.plan_change IS FALSE                                        -- ignore plan changes
             AND i.status = 'failed'                                           -- only included failed payments
             AND subscription_start_date :: date between '2021-10-27' and '2021-11-18'
-          group by 1)
-        ,
-     payments as
-         (select s.sso_user_id || '|' || s.dim_subscription_key as sso_key,
+          group by 1);
+
+
+drop table if exists payments;
+create temporary table payments
+    diststyle key
+    distkey(sso_key) as
+         (select s.sso_user_id --|| '|' || s.dim_subscription_key
+                                        as sso_key,
 --                  ta.payment_method,
-                 sum(t.total_amount)                            as total_amount,
-                 sum(t.tax_amount)                              as tax_amount,
-                 sum(t.discount_amount)                         as discount_amount
+                 sum(t.total_amount)    as total_amount,
+                 sum(t.tax_amount)      as tax_amount,
+                 sum(t.discount_amount) as discount_amount
           from elements.fact_elements_subscription_transactions t
                    join elements.dim_elements_subscription s on t.dim_subscription_key = s.dim_subscription_key
               AND subscription_start_date :: date between '2021-10-27' and '2021-11-18' and
                                                                 s.current_plan not like '%enterprise%'
                    join elements.dim_elements_transaction_attributes ta
                         on t.dim_elements_transaction_key = ta.dim_elements_transaction_key
-          group by 1)
-        ,
-     clean_sso as (
-         select user_uuid || '|' || dim_subscription_key                         as sso_key,
+          group by 1);
+
+drop table if exists uq;
+create temporary table uq
+    diststyle key
+    distkey(user_uuid) as
+(select user_uuid
+                        from enrollments b
+                                 join webanalytics.ds_bq_events_elements c on c.fullvisitorid::varchar = b.fullvisitorid
+                            and c.visitid = b.visitid
+                            and c.date between 20211027 and 20211118
+                        group by 1
+                        having min(variant) = max(variant))
+
+-- explain
+     with clean_sso as (
+         select user_uuid --|| '|' || dim_subscription_key
+                                                                                 as sso_key,
                 max(country)                                                     as country,
                 variant,
 
@@ -170,86 +255,36 @@ with enrollments as
 
 
          from webanalytics.ds_bq_events_elements c
-                  join (select user_uuid
-                        from enrollments b
-                                 join webanalytics.ds_bq_events_elements c on c.fullvisitorid::varchar = b.fullvisitorid
-                            and c.visitid = b.visitid
-                            and c.date between 20211027 and 20211118
-                        group by 1
-                        having min(variant) = max(variant)) using (user_uuid)
+                  join uq using (user_uuid)
                   join enrollments b on c.fullvisitorid::varchar = b.fullvisitorid
              and c.visitid = b.visitid
              and c.date between 20211027 and 20211118
 
---              --remove envato users
+             --              --remove envato users
 --                   join elements.ds_elements_sso_users sso
 --                        on sso.id = c.user_uuid and split_part(email, '@', 2) != 'envato.com'
 
                   left join elements.dim_elements_subscription d
-                            on c.user_uuid = d.sso_user_id || '|' || dim_subscription_key
+                            on c.user_uuid = d.sso_user_id -- || '|' || dim_subscription_key
+
 
                   left join content_t dl on c.user_uuid = dl.sso_uuid
---
+             --
 --
 --                   left join analysts.view_free_trial_refunds rf
 --                             on c.user_uuid = rf.sso_user_id
 
-                  left join failed_payments f on d.sso_user_id = d.sso_user_id || '|' || dim_subscription_key
+                  left join failed_payments f on c.user_uuid = f.sso_key -- || '|' || dim_subscription_key
 
-                  left join payments p on d.sso_user_id = d.sso_user_id || '|' || dim_subscription_key
-         group by 1, 3),
+                  left join payments p on c.user_uuid = p.sso_key -- || '|' || dim_subscription_key
+         group by 1, 3)
 
-     other_users as
-         (select b.fullvisitorid,
-
-                 max(country)                                                     as country,
-                 variant,
-                 null                                                             as plan_type,
---                  null                                                             as content_type,
-                 null                                                             as free_trial_status,
-                 max(case when hits_page_pagepath like '%/subscribe%' then 1 end) as sub_page,
-                 count(case when hits_page_pagepath like '%/pricing%' then 1 end) as pricing_page,
-                 null                                                             as non_free_trial_signups,
-                 null                                                             as free_trial_signups,
-                 null                                                             as total_new_signups,
-                 null                                                             as trial_sub_remaining,
-                 null                                                             as total_subs_remaining,
-                 null                                                             as total_subs_terminated,
-                 null                                                             as total_returning_subs_terminated,
-                 null                                                             as total_new_subs_terminated,
---                  null                                                             as refunds,
-                 null                                                             as failed_payments,
-                 null                                                             as cancelations,
-                 null                                                             as minus_cancellation,
-                 null                                                             as minus_failed_payments,
---                  null                                                             as minus_refunds,
-                 null                                                             as project_downloads,
-                 null                                                             as downloads,
-                 null                                                             as revenue,
-                 null                                                             as discounts,
-                 null                                                             as t_sub_cancel,
-                 null                                                             as t_sub_fail
-
-          from enrollments b
-                   join (select fullvisitorid
-                         from ds_bq_abtesting_enrolments_elements
-                         where experiment_id = 'geInrbFNTa2AZdiRswkP2A'
-                           and date between '2021-10-27' and '2021-11-18'
-                         group by 1
-                         having min(variant) = max(variant)) using (fullvisitorid)
-                   join webanalytics.ds_bq_events_elements c on c.fullvisitorid::varchar = b.fullvisitorid
-              and c.visitid = b.visitid
-              and c.date between 20211027 and 20211118
-              and c.user_uuid isnull
-          group by 1, 3
-         )
-
-select variant,
+select variant :: varchar,
        country,
        plan_type,
        count(free_trial_status)                                        as free_trials,
-       count(*)                                                        as accounts,
-       count(distinct split_part(sso_key, '|', 1))                     as users,
+       count(*)                                                        as users,
+--        count(distinct split_part(sso_key, '|', 1))                     as users,
        count(sub_page)                                                 as sub_page,
        count(pricing_page)                                             as pricing_page,
        count(non_free_trial_signups)                                   as non_free_trial_signups,
@@ -271,10 +306,34 @@ select variant,
        sum(case when free_trial_status = 1 then project_downloads end) as FT_licensed_dl,
        sum(t_sub_cancel)                                               as cancelled_trial,
        sum(t_sub_fail)                                                 as failpayment_trial
-from (select *
-      from clean_sso
-      union all
-      select *
-      from other_users) c
+from clean_sso
 group by 1, 2, 3
+
+union all
+
+(select variant :: varchar,
+        country :: varchar,
+        plan_type :: varchar,
+        free_trials :: bigint,
+        users :: bigint,
+        sub_page :: bigint,
+        pricing_page :: bigint,
+        non_free_trial_signups :: bigint,
+        total_new_signups :: bigint,
+        trial_sub_remaining :: bigint,
+        total_subs_remaining :: bigint,
+        total_new_subs_terminated :: bigint,
+        total_returning_subs_terminated :: bigint,
+        returning_subs_retained :: bigint,
+        failed_payments :: bigint,
+        minus_cancellation :: bigint,
+        minus_failed_payments :: bigint,
+        downloads :: bigint,
+        revenue_usd :: bigint,
+        discounts :: bigint,
+        FT_dl :: bigint,
+        FT_licensed_dl :: bigint,
+        cancelled_trial :: bigint,
+        failpayment_trial :: bigint
+ from merge_t)
 ;
